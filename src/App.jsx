@@ -18,8 +18,7 @@ const ALL_LOCS = [...US_LOCS, ...PRESALES_LOCS];
 const BLANK_DATA = () => ({
   date: "", type: "Monthly Review",
   membership: "", revenue: "", ops: "", growth: "",
-  tps: ["Review membership targets vs goal", "Staff structure and morale", "Upcoming campaigns or community events"],
-  notes: "", questions: "",
+  tps: [], notes: "", questions: "",
   sentiment: null, members: "", newMTD: "", ret: "", rev: "",
   recapNotes: "", actions: [], history: [],
 });
@@ -99,6 +98,58 @@ async function validateToken(token) {
   return user.login;
 }
 
+// ─── AI PREP GENERATOR ───────────────────────────────────────────────────────
+// Calls Anthropic API with Gmail + Drive + Circleback + Calendar MCP servers
+// to gather last-14-days context for a location, then drafts full prep.
+async function generatePrepFromSources(locName, locAddr, history) {
+  const since = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
+  const lastCheckin = history?.[0];
+
+  const systemPrompt = `You are an AI assistant helping a Fitstop US regional manager prepare for a performance check-in at Fitstop ${locName} (${locAddr}).
+
+Search ALL available tools — Gmail, Google Drive, Google Calendar, and Circleback — for any emails, documents, meeting notes, or calendar events related to "Fitstop ${locName}" or "${locName}" from the last 14 days (since ${since}).
+
+Based on everything you find, return ONLY a valid JSON object (no markdown, no explanation) with this exact structure:
+{
+  "membership": "2-3 sentences on membership trends, retention issues, churn, or wins surfaced in the data",
+  "revenue": "2-3 sentences on revenue performance, PT sales, upsells, or financial concerns",
+  "ops": "2-3 sentences on staffing, scheduling, facility, equipment issues or updates",
+  "growth": "2-3 sentences on leads, referrals, marketing, community events or growth initiatives",
+  "tps": ["talking point 1", "talking point 2", "talking point 3", "talking point 4", "talking point 5"],
+  "notes": "2-4 sentences of overall context and prep notes — key themes, watch-outs, recent incidents",
+  "questions": "3-5 open questions to ask the location manager, one per line",
+  "actions": [
+    {"text": "specific follow-up action", "owner": "person or role"},
+    {"text": "specific follow-up action", "owner": "person or role"}
+  ]
+}
+
+If a source has no relevant data, skip it and use what you find elsewhere. If nothing is found at all, return sensible defaults based on standard Fitstop check-in practice.${lastCheckin ? `\n\nContext from last check-in (${lastCheckin.date}): ${lastCheckin.recapNotes || "No notes"}. Previous actions: ${(lastCheckin.actions || []).map(a => a.text).join(", ") || "none"}.` : ""}`;
+
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 2000,
+      system: systemPrompt,
+      messages: [{ role: "user", content: `Generate prep for my check-in at Fitstop ${locName}. Search Gmail, Google Drive, Google Calendar, and Circleback for anything related to this location in the last 14 days.` }],
+      mcp_servers: [
+        { type: "url", url: "https://gmailmcp.googleapis.com/mcp/v1",        name: "gmail" },
+        { type: "url", url: "https://drivemcp.googleapis.com/mcp/v1",        name: "google-drive" },
+        { type: "url", url: "https://calendarmcp.googleapis.com/mcp/v1",     name: "google-calendar" },
+        { type: "url", url: "https://app.circleback.ai/api/mcp",             name: "circleback" },
+      ],
+    }),
+  });
+
+  if (!res.ok) throw new Error(`API error ${res.status}`);
+  const data = await res.json();
+  const txt = (data.content || []).filter(c => c.type === "text").map(c => c.text).join("");
+  const clean = txt.replace(/```json|```/g, "").trim();
+  return JSON.parse(clean);
+}
+
 // ─── SMALL UI COMPONENTS ─────────────────────────────────────────────────────
 const SectionHeading = ({ children }) => (
   <div className="flex items-center gap-3 mb-3">
@@ -142,6 +193,85 @@ const MetricCard = ({ label, value, onChange, suffix, large }) => (
   </div>
 );
 
+// ─── GENERATE PREP BUTTON ────────────────────────────────────────────────────
+function GeneratePrepBanner({ locName, locAddr, history, onGenerated, onError }) {
+  const [status, setStatus] = useState("idle"); // idle | scanning | done | error
+  const [sources, setSources] = useState([]);
+  const D = { fontFamily: "'Barlow Condensed', sans-serif" };
+
+  const SOURCE_STEPS = [
+    { key: "gmail",    icon: "✉️",  label: "Gmail" },
+    { key: "drive",    icon: "📂",  label: "Google Drive" },
+    { key: "calendar", icon: "📅",  label: "Calendar" },
+    { key: "cb",       icon: "⭕",  label: "Circleback" },
+  ];
+
+  async function generate() {
+    setStatus("scanning");
+    setSources([]);
+
+    // Animate source scanning
+    for (let i = 0; i < SOURCE_STEPS.length; i++) {
+      await new Promise(r => setTimeout(r, 600));
+      setSources(prev => [...prev, SOURCE_STEPS[i].key]);
+    }
+
+    try {
+      const result = await generatePrepFromSources(locName, locAddr, history);
+      setStatus("done");
+      onGenerated(result);
+    } catch (e) {
+      setStatus("error");
+      onError(e.message);
+    }
+  }
+
+  if (status === "idle") return (
+    <div style={{ background: "linear-gradient(135deg, rgba(242,103,34,0.1), rgba(242,103,34,0.04))", border: "0.5px solid rgba(242,103,34,0.35)", borderRadius: 8, padding: "14px 16px", marginBottom: 20, display: "flex", alignItems: "center", gap: 14 }}>
+      <div style={{ flex: 1 }}>
+        <div style={{ ...D, fontSize: 12, fontWeight: 700, letterSpacing: "0.08em", textTransform: "uppercase", color: "#F26722", marginBottom: 3 }}>✦ AI Prep Generator</div>
+        <div style={{ fontSize: 12, color: "#888", lineHeight: 1.5 }}>Scans your Gmail, Drive, Calendar & Circleback from the last 14 days to draft your full prep automatically.</div>
+      </div>
+      <button onClick={generate}
+        style={{ background: "#F26722", border: "none", borderRadius: 5, color: "#fff", ...D, fontSize: 12, fontWeight: 700, letterSpacing: "0.08em", textTransform: "uppercase", padding: "9px 18px", cursor: "pointer", whiteSpace: "nowrap", flexShrink: 0 }}>
+        ⚡ Generate Prep
+      </button>
+    </div>
+  );
+
+  if (status === "scanning") return (
+    <div style={{ background: "rgba(242,103,34,0.06)", border: "0.5px solid rgba(242,103,34,0.35)", borderRadius: 8, padding: "14px 16px", marginBottom: 20 }}>
+      <div style={{ ...D, fontSize: 12, fontWeight: 700, letterSpacing: "0.08em", textTransform: "uppercase", color: "#F26722", marginBottom: 10 }}>⚡ Scanning sources…</div>
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+        {SOURCE_STEPS.map(s => (
+          <div key={s.key} style={{ display: "flex", alignItems: "center", gap: 5, background: sources.includes(s.key) ? "rgba(99,153,34,0.15)" : "rgba(255,255,255,0.04)", border: `0.5px solid ${sources.includes(s.key) ? "rgba(99,153,34,0.4)" : "rgba(255,255,255,0.08)"}`, borderRadius: 4, padding: "5px 10px", transition: "all 0.3s" }}>
+            <span style={{ fontSize: 12 }}>{s.icon}</span>
+            <span style={{ ...D, fontSize: 10, fontWeight: 700, letterSpacing: "0.06em", textTransform: "uppercase", color: sources.includes(s.key) ? "#97C459" : "#555" }}>{s.label}</span>
+            {sources.includes(s.key) && <span style={{ color: "#97C459", fontSize: 10 }}>✓</span>}
+          </div>
+        ))}
+      </div>
+      <div style={{ fontSize: 11, color: "#555", marginTop: 10 }}>Drafting your prep — this takes about 15–30 seconds…</div>
+    </div>
+  );
+
+  if (status === "done") return (
+    <div style={{ background: "rgba(99,153,34,0.08)", border: "0.5px solid rgba(99,153,34,0.3)", borderRadius: 8, padding: "10px 16px", marginBottom: 20, display: "flex", alignItems: "center", gap: 10 }}>
+      <span style={{ color: "#97C459", fontSize: 14 }}>✓</span>
+      <span style={{ fontSize: 12, color: "#97C459" }}>Prep drafted from Gmail, Drive, Calendar & Circleback — review and edit below</span>
+      <button onClick={() => setStatus("idle")} style={{ marginLeft: "auto", background: "transparent", border: "none", color: "#555", fontSize: 11, cursor: "pointer", ...D, fontWeight: 700, letterSpacing: "0.06em", textTransform: "uppercase" }}>Regenerate</button>
+    </div>
+  );
+
+  if (status === "error") return (
+    <div style={{ background: "rgba(226,75,74,0.08)", border: "0.5px solid rgba(226,75,74,0.3)", borderRadius: 8, padding: "10px 16px", marginBottom: 20, display: "flex", alignItems: "center", gap: 10 }}>
+      <span style={{ color: "#E24B4A", fontSize: 14 }}>⚠</span>
+      <span style={{ fontSize: 12, color: "#E24B4A" }}>Could not generate prep — enter manually or try again</span>
+      <button onClick={() => setStatus("idle")} style={{ marginLeft: "auto", background: "transparent", border: "none", color: "#888", fontSize: 11, cursor: "pointer", ...D, fontWeight: 700, letterSpacing: "0.06em", textTransform: "uppercase" }}>Try Again</button>
+    </div>
+  );
+}
+
 // ─── GITHUB SETUP SCREEN ─────────────────────────────────────────────────────
 function GitHubSetup({ onConnect }) {
   const [token, setToken] = useState("");
@@ -173,25 +303,19 @@ function GitHubSetup({ onConnect }) {
         <div style={{ width: 1, height: 28, background: "rgba(255,255,255,0.08)" }} />
         <div style={{ ...D, fontSize: 17, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.06em" }}>Performance Check-Ins</div>
       </div>
-
       <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", padding: 24 }}>
         <div style={{ width: "100%", maxWidth: 480 }}>
-
           <div style={{ textAlign: "center", marginBottom: 32 }}>
             <div style={{ width: 56, height: 56, background: "rgba(242,103,34,0.12)", border: "1px solid rgba(242,103,34,0.3)", borderRadius: 12, display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 16px", fontSize: 26 }}>🐙</div>
             <div style={{ ...D, fontSize: 22, fontWeight: 800, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 8 }}>Connect GitHub</div>
-            <div style={{ fontSize: 13, color: "#888", lineHeight: 1.7 }}>
-              Your check-in data will sync to a private GitHub Gist —<br />
-              accessible from any device, any browser.
-            </div>
+            <div style={{ fontSize: 13, color: "#888", lineHeight: 1.7 }}>Your check-in data syncs to a private GitHub Gist —<br />accessible from any device, any browser.</div>
           </div>
-
           <div style={{ background: "#1A1A1A", border: "0.5px solid rgba(255,255,255,0.08)", borderRadius: 8, padding: 20, marginBottom: 20 }}>
             <div style={{ ...D, fontSize: 10, fontWeight: 700, letterSpacing: "0.12em", textTransform: "uppercase", color: "#F26722", marginBottom: 14 }}>How to get a token</div>
             {[
               { n: "1", text: <span>Go to <a href="https://github.com/settings/tokens/new" target="_blank" rel="noreferrer" style={{ color: "#F26722", textDecoration: "none" }}>github.com/settings/tokens/new</a></span> },
               { n: "2", text: <span>Set a note like <b style={{ color: "#fff", fontWeight: 600 }}>"Fitstop Check-Ins"</b> and an expiry</span> },
-              { n: "3", text: <span>Under <b style={{ color: "#fff", fontWeight: 600 }}>Scopes</b>, tick <b style={{ color: "#fff", fontWeight: 600 }}>gist</b> only — nothing else needed</span> },
+              { n: "3", text: <span>Under <b style={{ color: "#fff", fontWeight: 600 }}>Scopes</b>, tick <b style={{ color: "#fff", fontWeight: 600 }}>gist</b> only</span> },
               { n: "4", text: <span>Click <b style={{ color: "#fff", fontWeight: 600 }}>Generate token</b>, copy it, paste below</span> },
             ].map(({ n, text }) => (
               <div key={n} style={{ display: "flex", gap: 12, marginBottom: 10, alignItems: "flex-start" }}>
@@ -200,29 +324,18 @@ function GitHubSetup({ onConnect }) {
               </div>
             ))}
           </div>
-
           <div style={{ marginBottom: 12 }}>
             <label style={{ display: "block", ...D, fontSize: 10, fontWeight: 700, letterSpacing: "0.1em", textTransform: "uppercase", color: "#888", marginBottom: 6 }}>Personal Access Token</label>
-            <input
-              type="password"
-              value={token}
-              onChange={e => { setToken(e.target.value); setStatus(null); }}
-              onKeyDown={e => e.key === "Enter" && connect()}
+            <input type="password" value={token} onChange={e => { setToken(e.target.value); setStatus(null); }} onKeyDown={e => e.key === "Enter" && connect()}
               placeholder="ghp_xxxxxxxxxxxxxxxxxxxx"
-              style={{ width: "100%", background: "#1A1A1A", border: `0.5px solid ${status === "error" ? "#E24B4A" : "rgba(255,255,255,0.12)"}`, borderRadius: 5, color: "#fff", fontFamily: "monospace", fontSize: 13, padding: "10px 12px", outline: "none" }}
-            />
+              style={{ width: "100%", background: "#1A1A1A", border: `0.5px solid ${status === "error" ? "#E24B4A" : "rgba(255,255,255,0.12)"}`, borderRadius: 5, color: "#fff", fontFamily: "monospace", fontSize: 13, padding: "10px 12px", outline: "none" }} />
             {status === "error" && <div style={{ fontSize: 12, color: "#E24B4A", marginTop: 6 }}>⚠ {errorMsg}</div>}
           </div>
-
           <button onClick={connect} disabled={!token.trim() || status === "checking"}
             style={{ width: "100%", background: status === "checking" ? "rgba(242,103,34,0.5)" : "#F26722", border: "none", borderRadius: 5, color: "#fff", ...D, fontSize: 14, fontWeight: 700, letterSpacing: "0.08em", textTransform: "uppercase", padding: "11px 0", cursor: !token.trim() || status === "checking" ? "not-allowed" : "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}>
             {status === "checking" ? "Connecting…" : "🔗 Connect & Sync"}
           </button>
-
-          <div style={{ fontSize: 11, color: "#555", textAlign: "center", marginTop: 14, lineHeight: 1.6 }}>
-            Your token is stored only in this browser's localStorage.<br />
-            Data syncs to a private Gist only you can see.
-          </div>
+          <div style={{ fontSize: 11, color: "#555", textAlign: "center", marginTop: 14, lineHeight: 1.6 }}>Token stored in browser localStorage only.<br />Data syncs to a private Gist only you can see.</div>
         </div>
       </div>
     </div>
@@ -234,15 +347,14 @@ export default function App() {
   const [ghToken, setGhToken]     = useState(null);
   const [ghGistId, setGhGistId]   = useState(null);
   const [setupDone, setSetupDone] = useState(false);
-
-  const [allData, setAllData] = useState({});
-  const [locId, setLocId]     = useState("santa-monica");
-  const [view, setView]       = useState("prep");
-  const [tab, setTab]         = useState("focus");
-  const [draft, setDraft]     = useState(BLANK_DATA());
-  const [loading, setLoading] = useState(true);
-  const [syncing, setSyncing] = useState(false);
-  const [toast, setToast]     = useState(null);
+  const [allData, setAllData]     = useState({});
+  const [locId, setLocId]         = useState("santa-monica");
+  const [view, setView]           = useState("prep");
+  const [tab, setTab]             = useState("focus");
+  const [draft, setDraft]         = useState(BLANK_DATA());
+  const [loading, setLoading]     = useState(true);
+  const [syncing, setSyncing]     = useState(false);
+  const [toast, setToast]         = useState(null);
 
   const [cbQuery, setCbQuery]         = useState("");
   const [cbSearching, setCbSearching] = useState(false);
@@ -296,7 +408,7 @@ export default function App() {
   const showToast = useCallback((msg, isError = false) => {
     setToast({ msg, isError });
     clearTimeout(toastRef.current);
-    toastRef.current = setTimeout(() => setToast(null), 3000);
+    toastRef.current = setTimeout(() => setToast(null), 3500);
   }, []);
 
   const currentLoc = ALL_LOCS.find(l => l.id === locId);
@@ -332,6 +444,24 @@ export default function App() {
     await save(reset);
     setView("history");
     showToast("Check-in archived & synced ✓");
+  }
+
+  // Called when AI prep generation completes
+  function onPrepGenerated(result) {
+    setDraft(d => ({
+      ...d,
+      membership: result.membership || d.membership,
+      revenue:    result.revenue    || d.revenue,
+      ops:        result.ops        || d.ops,
+      growth:     result.growth     || d.growth,
+      tps:        result.tps?.length ? result.tps : d.tps,
+      notes:      result.notes      || d.notes,
+      questions:  result.questions  || d.questions,
+      actions:    result.actions?.length
+        ? [...d.actions, ...result.actions.map(a => ({ text: a.text || "", owner: a.owner || "", done: false }))]
+        : d.actions,
+    }));
+    showToast("Prep drafted from your emails, docs & meetings ✓");
   }
 
   async function cbSearch() {
@@ -415,19 +545,13 @@ export default function App() {
         <div style={{ ...D, fontWeight: 800, fontSize: 22, letterSpacing: "0.04em", textTransform: "uppercase", color: "#F26722" }}>Fitstop</div>
         <div style={{ width: 1, height: 28, background: "rgba(255,255,255,0.08)" }} />
         <div style={{ ...D, fontSize: 17, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.06em", flex: 1 }}>Performance Check-Ins</div>
-
-        {/* Sync indicator */}
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 6, background: syncing ? "rgba(242,103,34,0.1)" : "rgba(99,153,34,0.1)", border: `0.5px solid ${syncing ? "rgba(242,103,34,0.3)" : "rgba(99,153,34,0.3)"}`, borderRadius: 4, padding: "4px 10px" }}>
             <div style={{ width: 6, height: 6, borderRadius: "50%", background: syncing ? "#F26722" : "#97C459", animation: syncing ? "pulse 1s infinite" : "none" }} />
             <span style={{ ...D, fontSize: 10, fontWeight: 700, letterSpacing: "0.08em", textTransform: "uppercase", color: syncing ? "#F26722" : "#97C459" }}>{syncing ? "Syncing…" : "GitHub Sync"}</span>
           </div>
-          <button onClick={disconnect} title="Disconnect GitHub"
-            style={{ background: "transparent", border: "0.5px solid rgba(255,255,255,0.08)", borderRadius: 4, color: "#555", ...D, fontSize: 10, fontWeight: 700, letterSpacing: "0.06em", textTransform: "uppercase", padding: "4px 8px", cursor: "pointer" }}>
-            ⎋ Disconnect
-          </button>
+          <button onClick={disconnect} style={{ background: "transparent", border: "0.5px solid rgba(255,255,255,0.08)", borderRadius: 4, color: "#555", ...D, fontSize: 10, fontWeight: 700, letterSpacing: "0.06em", textTransform: "uppercase", padding: "4px 8px", cursor: "pointer" }}>⎋ Disconnect</button>
         </div>
-
         <span style={{ ...D, background: "rgba(242,103,34,0.15)", border: "0.5px solid rgba(242,103,34,0.4)", color: "#F26722", fontSize: 10, fontWeight: 700, letterSpacing: "0.1em", textTransform: "uppercase", padding: "4px 10px", borderRadius: 3 }}>🇺🇸 US Locations</span>
         <div style={{ display: "flex", gap: 4 }}>
           {["prep", "recap", "history"].map(v => (
@@ -486,8 +610,18 @@ export default function App() {
                 ))}
               </div>
               <div style={{ flex: 1, overflowY: "auto", padding: "20px 24px" }}>
+
                 {tab === "focus" && (
                   <>
+                    {/* AI GENERATE BANNER */}
+                    <GeneratePrepBanner
+                      locName={currentLoc?.name}
+                      locAddr={currentLoc?.addr}
+                      history={draft.history}
+                      onGenerated={onPrepGenerated}
+                      onError={msg => showToast(msg || "Generation failed", true)}
+                    />
+
                     <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12, marginBottom: 20 }}>
                       {[
                         { label: "Location", el: <input value={`Fitstop ${currentLoc?.name}`} readOnly style={{ width: "100%", background: "#242424", border: "0.5px solid rgba(255,255,255,0.08)", borderRadius: 4, color: "#fff", fontFamily: "'Barlow', sans-serif", fontSize: 13, padding: "8px 10px", outline: "none" }} /> },
@@ -505,6 +639,7 @@ export default function App() {
                         </div>
                       ))}
                     </div>
+
                     <SectionHeading>Focus Areas</SectionHeading>
                     <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 20 }}>
                       <FocusCard icon="👥" label="Membership" value={draft.membership} onChange={v => setDraft(d => ({ ...d, membership: v }))} placeholder="Member numbers, retention, churn concerns..." />
@@ -514,6 +649,7 @@ export default function App() {
                     </div>
                   </>
                 )}
+
                 {tab === "talking" && (
                   <>
                     <SectionHeading>Talking Points</SectionHeading>
@@ -526,16 +662,20 @@ export default function App() {
                           <button onClick={() => delTP(i)} style={{ background: "none", border: "none", color: "rgba(255,255,255,0.2)", cursor: "pointer", fontSize: 13, padding: 0 }}>✕</button>
                         </div>
                       ))}
+                      {draft.tps.length === 0 && (
+                        <div style={{ fontSize: 12, color: "#555", padding: "12px 0" }}>No talking points yet — use ⚡ Generate Prep on the Focus Areas tab to draft them automatically.</div>
+                      )}
                     </div>
                     <button onClick={addTP} style={{ background: "transparent", border: "0.5px dashed rgba(255,255,255,0.15)", borderRadius: 4, color: "#888", ...D, fontSize: 11, fontWeight: 700, letterSpacing: "0.08em", textTransform: "uppercase", padding: "7px 14px", cursor: "pointer", display: "inline-flex", alignItems: "center", gap: 6 }}>+ Add point</button>
                   </>
                 )}
+
                 {tab === "notes" && (
                   <>
                     <SectionHeading>Context & Prep Notes</SectionHeading>
-                    <NotesBlock value={draft.notes} onChange={v => setDraft(d => ({ ...d, notes: v }))} rows={5} placeholder="Anything to remember going in — last meeting outcomes, staff changes, recent incidents, things to probe on..." />
+                    <NotesBlock value={draft.notes} onChange={v => setDraft(d => ({ ...d, notes: v }))} rows={5} placeholder="Context from emails, docs and meetings will appear here after generating prep..." />
                     <SectionHeading>Questions to Ask</SectionHeading>
-                    <NotesBlock value={draft.questions} onChange={v => setDraft(d => ({ ...d, questions: v }))} rows={4} placeholder="Open questions to raise in the meeting..." />
+                    <NotesBlock value={draft.questions} onChange={v => setDraft(d => ({ ...d, questions: v }))} rows={4} placeholder="Questions drafted from your sources will appear here..." />
                   </>
                 )}
               </div>
